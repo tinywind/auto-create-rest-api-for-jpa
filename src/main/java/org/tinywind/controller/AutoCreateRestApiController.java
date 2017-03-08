@@ -123,20 +123,14 @@ public class AutoCreateRestApiController {
 
 		// /!api/parent?.search&name=p&name.0.o=LIKE
 		final Predicate<String> isOperator = key -> {
-			try {
-				Integer.valueOf(key.split("[.]")[1]);
-			} catch (Exception ignored) {
-				return false;
-			}
-			return true;
+			String[] split = key.split("[.]");
+			return split.length >= 2 && !split[1].chars().filter(c -> !Character.isDigit(c)).findAny().isPresent();
 		};
 
 		parameterMap.keySet().stream().filter(isOperator.negate()).forEach(key -> {
 			if (key.equalsIgnoreCase(".search")) return;
-			for (String value : parameterMap.get(key)) {
-				List<Operation> operations = mapKeyOperations.computeIfAbsent(key, s -> new ArrayList<>());
-				operations.add(new Operation(key, value));
-			}
+			for (String value : parameterMap.get(key))
+				mapKeyOperations.computeIfAbsent(key, s -> new ArrayList<>()).add(new Operation(key, value));
 		});
 
 		try {
