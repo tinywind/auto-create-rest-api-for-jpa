@@ -121,7 +121,8 @@ public class AutoCreateRestApiController {
 		final Map<String, String[]> parameterMap = request.getParameterMap();
 		final Map<String, List<Operation>> mapKeyOperations = new HashMap<>();
 
-		// /!api/parent?.search&name=p&name.0.o=LIKE
+		// /!api/{objectType}?.search&{column}={operand}&{column}.{index of column}={operator}
+		// /!api/parent?.search&name=p&name.0=LIKE
 		final Predicate<String> isOperator = key -> {
 			String[] split = key.split("[.]");
 			return split.length >= 2 && !split[1].chars().filter(c -> !Character.isDigit(c)).findAny().isPresent();
