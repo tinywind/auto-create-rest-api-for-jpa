@@ -145,7 +145,7 @@ public class AutoCreateRestApiController {
 		}
 
 		final StringBuilder whereString = new StringBuilder();
-		whereString.append(mapKeyOperations.values().size() == 0 ? "" : " WHERE ");
+		whereString.append(mapKeyOperations.values().stream().filter(operations -> operations.size() > 0).count() == 0 ? "" : " WHERE ");
 		mapKeyOperations.values().forEach(operations -> operations.forEach(whereString::append));
 
 		try (final Session session = sessionFactory.openSession()) {
