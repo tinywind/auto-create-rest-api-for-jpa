@@ -11,9 +11,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.PostConstruct;
 import javax.persistence.Id;
@@ -25,6 +23,7 @@ import java.io.Serializable;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.*;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 /**
@@ -72,6 +71,14 @@ public class AutoCreateRestApiController {
 		return buf.toString().toLowerCase(Locale.ROOT);
 	}
 
+	/**
+	 * uri name to table name
+	 */
+	private static String tableName(String dashName) {
+		final String originName = originName(dashName);
+		return originName.substring(0, 1).toUpperCase() + originName.substring(1);
+	}
+
 	private static Method getSetter(Class<?> klass, String fieldName, Class<?> paramType) throws NoSuchMethodException {
 		return klass.getMethod("set" + fieldName.substring(0, 1).toUpperCase() + fieldName.substring(1), paramType);
 	}
@@ -109,6 +116,52 @@ public class AutoCreateRestApiController {
 		return idFieldList.get(0);
 	}
 
+	@RequestMapping(value = "{objectType}", method = RequestMethod.GET, params = ".search")
+	public ResponseEntity<?> search(HttpServletRequest request, @PathVariable String objectType) throws IllegalAccessException {
+		final Map<String, String[]> parameterMap = request.getParameterMap();
+		final Map<String, List<Operation>> mapKeyOperations = new HashMap<>();
+
+		// /!api/parent?.search&name=p&name.0.o=LIKE
+		final Predicate<String> isOperator = key -> {
+			try {
+				Integer.valueOf(key.split("[.]")[1]);
+			} catch (Exception ignored) {
+				return false;
+			}
+			return true;
+		};
+
+		parameterMap.keySet().stream().filter(isOperator.negate()).forEach(key -> {
+			if (key.equalsIgnoreCase(".search")) return;
+			for (String value : parameterMap.get(key)) {
+				List<Operation> operations = mapKeyOperations.computeIfAbsent(key, s -> new ArrayList<>());
+				operations.add(new Operation(key, value));
+			}
+		});
+
+		try {
+			parameterMap.keySet().stream().filter(isOperator).forEach(key -> {
+				String[] split = key.split("[.]");
+				List<Operation> operations = mapKeyOperations.get(split[0]);
+				operations.get(Integer.valueOf(split[1])).operator = Operation.Operator.of(parameterMap.get(key)[0]);
+			});
+		} catch (NullPointerException e) {
+			return new ResponseEntity<>("invalid parameters", HttpStatus.BAD_REQUEST);
+		}
+
+		final StringBuilder whereString = new StringBuilder();
+		whereString.append(mapKeyOperations.values().size() == 0 ? "" : " WHERE ");
+		mapKeyOperations.values().forEach(operations -> operations.forEach(whereString::append));
+
+		try (final Session session = sessionFactory.openSession()) {
+			List list = session.createQuery("FROM " + tableName(objectType) + whereString).list();
+			return new ResponseEntity<>(list, HttpStatus.OK);
+		} catch (Exception e) {
+			log.error(e.getMessage(), e);
+			return new ResponseEntity<>(e.getMessage(), HttpStatus.INTERNAL_SERVER_ERROR);
+		}
+	}
+
 	@SuppressWarnings("unchecked")
 	@RequestMapping(value = "**", produces = MediaType.APPLICATION_JSON_VALUE)
 	public ResponseEntity<?> processApi(HttpServletRequest request, @RequestBody(required = false) String body) throws IllegalAccessException {
@@ -122,7 +175,7 @@ public class AutoCreateRestApiController {
 		final Class mappedClass = metadata.getMappedClass();
 		final Field idField = getIdField(mappedClass);
 
-		try (Session session = sessionFactory.openSession()) {
+		try (final Session session = sessionFactory.openSession()) {
 			switch (method) {
 				case "GET": {
 					// GET /!api/{objectType}
@@ -201,6 +254,56 @@ public class AutoCreateRestApiController {
 		} catch (Exception e) {
 			log.error(e.getMessage(), e);
 			return new ResponseEntity<>(e.getMessage(), HttpStatus.INTERNAL_SERVER_ERROR);
+		}
+	}
+
+	static class Operation {
+		String column;
+		Operator operator = Operator.EQUAL;
+		String value;
+
+		Operation(String column, String value) {
+			this.column = column;
+			this.value = value;
+		}
+
+		Operation(String column, Operator operator, String value) {
+			this.column = column;
+			this.operator = operator;
+			this.value = value;
+		}
+
+		@Override
+		public String toString() {
+			return toString(false);
+		}
+
+		String toString(boolean stringType) {
+			if (operator.equals(Operator.LIKE)) return " " + column + " LIKE '%" + value + "%' ";
+			return " " + column + " " + operator + " " + (stringType ? value : "'" + value.replaceAll("[']", "\\'") + "'");
+		}
+
+		enum Operator {
+			LIKE("LIKE"), EQUAL("="), GREATER(">"), LESS("<"), GREATER_OR_EQUAL(">="), LESS_OR_EQUAL("<=");
+
+			String string;
+
+			Operator(String string) {
+				this.string = string;
+			}
+
+			static Operator of(String string) {
+				for (Operator operator : Operator.values()) {
+					if (operator.string.equals(string))
+						return operator;
+				}
+				return null;
+			}
+
+			@Override
+			public String toString() {
+				return string;
+			}
 		}
 	}
 }
