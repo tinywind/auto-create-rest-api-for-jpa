@@ -1,23 +1,24 @@
 package org.tinywind.controller;
 
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.cfg.EnumFeature;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
-import org.hibernate.metadata.ClassMetadata;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import javax.annotation.PostConstruct;
-import javax.persistence.Id;
-import javax.persistence.ManyToMany;
-import javax.persistence.OneToMany;
-import javax.servlet.http.HttpServletRequest;
+import jakarta.annotation.PostConstruct;
+import jakarta.persistence.EntityManagerFactory;
+import jakarta.persistence.Id;
+import jakarta.persistence.ManyToMany;
+import jakarta.persistence.OneToMany;
+import jakarta.servlet.http.HttpServletRequest;
 import java.io.IOException;
 import java.io.Serializable;
 import java.lang.reflect.Field;
@@ -35,11 +36,11 @@ import java.util.stream.Collectors;
 public class AutoCreateRestApiController {
 	private final Log log = LogFactory.getLog(getClass());
 	private final SessionFactory sessionFactory;
-	private Map<String, ClassMetadata> mapNameMeta = new HashMap<>();
+	private Map<String, Class<?>> mapNameClass = new HashMap<>();
 
 	@Autowired
-	public AutoCreateRestApiController(SessionFactory sessionFactory) {
-		this.sessionFactory = sessionFactory;
+	public AutoCreateRestApiController(EntityManagerFactory entityManagerFactory) {
+		this.sessionFactory = entityManagerFactory.unwrap(SessionFactory.class);
 	}
 
 	/**
@@ -100,10 +101,11 @@ public class AutoCreateRestApiController {
 
 	@PostConstruct
 	public void setup() throws IOException, ClassNotFoundException {
-		sessionFactory.getAllClassMetadata().forEach((packageName, meta) -> {
+		sessionFactory.getMetamodel().getEntities().forEach(entity -> {
+			final String packageName = entity.getJavaType().getName();
 			final int iClassName = packageName.lastIndexOf(".");
 			final String className = packageName.substring(iClassName >= 0 ? iClassName + 1 : 0);
-			mapNameMeta.put(dashName(className), meta);
+			mapNameClass.put(dashName(className), entity.getJavaType());
 		});
 	}
 
@@ -149,7 +151,7 @@ public class AutoCreateRestApiController {
 		mapKeyOperations.values().forEach(operations -> operations.forEach(whereString::append));
 
 		try (final Session session = sessionFactory.openSession()) {
-			List list = session.createQuery("FROM " + tableName(objectType) + whereString).list();
+			List list = session.createSelectionQuery("FROM " + tableName(objectType) + whereString).list();
 			return new ResponseEntity<>(list, HttpStatus.OK);
 		} catch (Exception e) {
 			log.error(e.getMessage(), e);
@@ -165,32 +167,34 @@ public class AutoCreateRestApiController {
 
 		if (uris.length < 3) return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
 
-		final ClassMetadata metadata = mapNameMeta.get(originName(uris[2]));
-		if (metadata == null) return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
-		final Class mappedClass = metadata.getMappedClass();
+		final Class mappedClass = mapNameClass.get(originName(uris[2]));
+		if (mappedClass == null) return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
 		final Field idField = getIdField(mappedClass);
 
 		try (final Session session = sessionFactory.openSession()) {
+			if (!"GET".equals(method)) session.beginTransaction();
 			switch (method) {
 				case "GET": {
 					// GET /!api/{objectType}
 					if (uris.length < 4)
-						return new ResponseEntity<>(session.createCriteria(mappedClass).list(), HttpStatus.OK);
+						return new ResponseEntity<>(session.createSelectionQuery("FROM " + mappedClass.getName(), mappedClass).list(), HttpStatus.OK);
 
 					// GET /!api/{objectType}/{id}
 					Method valueOf = idField.getType().getMethod("valueOf", String.class);
 					Object idValue = valueOf.invoke(null, uris[3]);
 
-					final Object target = session.get(mappedClass, (Serializable) idValue);
+					final Object target = session.find(mappedClass, idValue);
 					return new ResponseEntity<>(target, HttpStatus.OK);
 				}
 				case "POST": { // POST /!api/{objectType}
-					ObjectMapper mapper = new ObjectMapper();
-					mapper.configure(DeserializationFeature.EAGER_DESERIALIZER_FETCH, true);
-					mapper.configure(DeserializationFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE, true);
-					mapper.configure(DeserializationFeature.USE_JAVA_ARRAY_FOR_JSON_ARRAY, true);
+					JsonMapper mapper = JsonMapper.builder()
+							.enable(EnumFeature.READ_UNKNOWN_ENUM_VALUES_USING_DEFAULT_VALUE)
+							.enable(DeserializationFeature.EAGER_DESERIALIZER_FETCH,
+									DeserializationFeature.USE_JAVA_ARRAY_FOR_JSON_ARRAY)
+							.build();
 					final Object value = mapper.readValue(body, mappedClass);
-					final Serializable id = session.save(value);
+					session.persist(value);
+					final Serializable id = (Serializable) session.getIdentifier(value);
 
 					final List<Field> references = Arrays.stream(mappedClass.getDeclaredFields())
 							.filter(field -> field.isAnnotationPresent(OneToMany.class) || field.isAnnotationPresent(ManyToMany.class))
@@ -212,11 +216,12 @@ public class AutoCreateRestApiController {
 									log.error(e.getMessage(), e);
 									continue;
 								}
-								session.save(o);
+								session.persist(o);
 							}
 					}
 
 					session.flush();
+					session.getTransaction().commit();
 					return new ResponseEntity<>(HttpStatus.OK);
 				}
 				case "PUT": { // PUT /!api/{objectType}/{id}
@@ -224,11 +229,12 @@ public class AutoCreateRestApiController {
 					Method valueOf = idField.getType().getMethod("valueOf", String.class);
 					Object idValue = valueOf.invoke(null, uris[3]);
 
-					final Object value = new ObjectMapper().readValue(body, mappedClass);
+					final Object value = JsonMapper.builder().build().readValue(body, mappedClass);
 					getSetter(mappedClass, idField.getName(), idField.getType()).invoke(value, idValue);
 
-					session.update(value);
+					session.merge(value);
 					session.flush();
+					session.getTransaction().commit();
 					return new ResponseEntity<>(HttpStatus.OK);
 				}
 				case "DELETE": { // DELETE /!api/{objectType}/{id}
@@ -236,10 +242,11 @@ public class AutoCreateRestApiController {
 					Method valueOf = idField.getType().getMethod("valueOf", String.class);
 					Object idValue = valueOf.invoke(null, uris[3]);
 
-					final Object target = session.get(mappedClass, (Serializable) idValue);
+					final Object target = session.find(mappedClass, idValue);
 
-					session.delete(target);
+					session.remove(target);
 					session.flush();
+					session.getTransaction().commit();
 					return new ResponseEntity<>(HttpStatus.OK);
 				}
 				default: {
