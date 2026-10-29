@@ -16,6 +16,12 @@ import org.springframework.web.bind.annotation.*;
 import jakarta.annotation.PostConstruct;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.Id;
+import jakarta.persistence.criteria.CriteriaBuilder;
+import jakarta.persistence.criteria.CriteriaQuery;
+import jakarta.persistence.criteria.Expression;
+import jakarta.persistence.criteria.Root;
+import org.springframework.core.convert.ConversionException;
+import org.springframework.core.convert.support.DefaultConversionService;
 import jakarta.persistence.ManyToMany;
 import jakarta.persistence.OneToMany;
 import jakarta.servlet.http.HttpServletRequest;
@@ -72,14 +78,6 @@ public class AutoCreateRestApiController {
 		return buf.toString().toLowerCase(Locale.ROOT);
 	}
 
-	/**
-	 * uri name to table name
-	 */
-	private static String tableName(String dashName) {
-		final String originName = originName(dashName);
-		return originName.substring(0, 1).toUpperCase() + originName.substring(1);
-	}
-
 	private static Method getSetter(Class<?> klass, String fieldName, Class<?> paramType) throws NoSuchMethodException {
 		return klass.getMethod("set" + fieldName.substring(0, 1).toUpperCase() + fieldName.substring(1), paramType);
 	}
@@ -120,6 +118,8 @@ public class AutoCreateRestApiController {
 
 	@RequestMapping(value = "{objectType}", method = RequestMethod.GET, params = ".search")
 	public ResponseEntity<?> search(HttpServletRequest request, @PathVariable String objectType) throws IllegalAccessException {
+		final Class<?> mappedClass = mapNameClass.get(objectType.toLowerCase(Locale.ROOT));
+		if (mappedClass == null) return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
 		final Map<String, String[]> parameterMap = request.getParameterMap();
 		final Map<String, List<Operation>> mapKeyOperations = new HashMap<>();
 
@@ -140,19 +140,50 @@ public class AutoCreateRestApiController {
 			parameterMap.keySet().stream().filter(isOperator).forEach(key -> {
 				String[] split = key.split("[.]");
 				List<Operation> operations = mapKeyOperations.get(split[0]);
-				operations.get(Integer.valueOf(split[1])).operator = Operation.Operator.of(parameterMap.get(key)[0]);
+				Operation.Operator operator = Operation.Operator.of(parameterMap.get(key)[0]);
+				if (operator == null) throw new IllegalArgumentException("Unknown search operator");
+				operations.get(Integer.parseInt(split[1])).operator = operator;
 			});
-		} catch (NullPointerException e) {
+		} catch (NullPointerException | IndexOutOfBoundsException | IllegalArgumentException e) {
 			return new ResponseEntity<>("invalid parameters", HttpStatus.BAD_REQUEST);
 		}
 
-		final StringBuilder whereString = new StringBuilder();
-		whereString.append(mapKeyOperations.values().stream().filter(operations -> operations.size() > 0).count() == 0 ? "" : " WHERE ");
-		mapKeyOperations.values().forEach(operations -> operations.forEach(whereString::append));
-
 		try (final Session session = sessionFactory.openSession()) {
-			List list = session.createSelectionQuery("FROM " + tableName(objectType) + whereString).list();
+			CriteriaBuilder builder = session.getCriteriaBuilder();
+			CriteriaQuery<?> query = builder.createQuery(mappedClass);
+			Root<?> root = query.from(mappedClass);
+			List<jakarta.persistence.criteria.Predicate> predicates = new ArrayList<>();
+			for (List<Operation> operations : mapKeyOperations.values()) {
+				for (Operation operation : operations) {
+					jakarta.persistence.criteria.Path<?> path = root.get(operation.column);
+					if (operation.operator == Operation.Operator.LIKE) {
+						if (path.getJavaType() != String.class) throw new IllegalArgumentException("LIKE requires a string attribute");
+						predicates.add(builder.like(path.as(String.class), "%" + operation.value + "%"));
+						continue;
+					}
+					Object value = DefaultConversionService.getSharedInstance().convert(operation.value, path.getJavaType());
+					if (value == null) throw new IllegalArgumentException("Invalid search value");
+					if (operation.operator == Operation.Operator.EQUAL) {
+						predicates.add(builder.equal(path, value));
+						continue;
+					}
+					if (!(value instanceof Comparable)) throw new IllegalArgumentException("Search attribute is not comparable");
+					Expression<Comparable> expression = (Expression) path;
+					Comparable comparable = (Comparable) value;
+					switch (operation.operator) {
+						case GREATER: predicates.add(builder.greaterThan(expression, comparable)); break;
+						case LESS: predicates.add(builder.lessThan(expression, comparable)); break;
+						case GREATER_OR_EQUAL: predicates.add(builder.greaterThanOrEqualTo(expression, comparable)); break;
+						case LESS_OR_EQUAL: predicates.add(builder.lessThanOrEqualTo(expression, comparable)); break;
+						default: throw new IllegalArgumentException("Unsupported search operator");
+					}
+				}
+			}
+			query.where(builder.and(predicates.toArray(new jakarta.persistence.criteria.Predicate[0])));
+			List<?> list = session.createSelectionQuery(query).list();
 			return new ResponseEntity<>(list, HttpStatus.OK);
+		} catch (IllegalArgumentException | ConversionException e) {
+			return new ResponseEntity<>("invalid parameters", HttpStatus.BAD_REQUEST);
 		} catch (Exception e) {
 			log.error(e.getMessage(), e);
 			return new ResponseEntity<>(e.getMessage(), HttpStatus.INTERNAL_SERVER_ERROR);
@@ -275,16 +306,6 @@ public class AutoCreateRestApiController {
 			this.value = value;
 		}
 
-		@Override
-		public String toString() {
-			return toString(false);
-		}
-
-		String toString(boolean stringType) {
-			if (operator.equals(Operator.LIKE)) return " " + column + " LIKE '%" + value + "%' ";
-			return " " + column + " " + operator + " " + (stringType ? value : "'" + value.replaceAll("[']", "\\'") + "'");
-		}
-
 		enum Operator {
 			LIKE("LIKE"), EQUAL("="), GREATER(">"), LESS("<"), GREATER_OR_EQUAL(">="), LESS_OR_EQUAL("<=");
 
@@ -300,11 +321,6 @@ public class AutoCreateRestApiController {
 						return operator;
 				}
 				return null;
-			}
-
-			@Override
-			public String toString() {
-				return string;
 			}
 		}
 	}
