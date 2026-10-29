@@ -2,7 +2,7 @@ package org.tinywind.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 
-import javax.persistence.*;
+import jakarta.persistence.*;
 
 /**
  * @author tinywind
